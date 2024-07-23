@@ -512,17 +512,46 @@ fn key_for_release(release: &Release) -> (Quality, String) {
 
 impl ConnectionManager {
 	pub fn new(ctx: &CommandContext, platform: Platform, args: ServeWebArgs) -> Arc<Self> {
+		let cache = DownloadCache::load(ctx.paths.web_server_storage());
+		let latest_version: tokio::sync::Mutex<Option<(Instant, Release)>>;
+		let target_kind = TargetKind::Web;
+
+		//Set the instant to now minus the RELEASE_CACHE_SECS
+		//This is allows the service to skip use of the cache for the first run
+		let instant = Instant::now() - Duration::from_secs(RELEASE_CACHE_SECS);
+
+		let quality = VSCODE_CLI_QUALITY
+			.map_or(Quality::Stable, |q| {
+				match Quality::try_from(q) {
+					Ok(q) => q,
+					Err(_) => Quality::Stable
+				}
+			});
+
+		if let Some(latest_commit) = cache.get().first() {
+			let release = Release {
+				name: String::from("0.0.0"), // Version information not stored on cache
+				commit: latest_commit.clone(),
+				platform,
+				target: target_kind,
+				quality
+			};
+			latest_version = tokio::sync::Mutex::new(Some((instant, release.clone())));
+		} else {
+			latest_version = tokio::sync::Mutex::default();
+		}
+
 		Arc::new(Self {
 			platform,
 			args,
 			log: ctx.log.clone(),
-			cache: DownloadCache::load(ctx.paths.web_server_storage()),
+			cache,
 			update_service: UpdateService::new(
 				ctx.log.clone(),
 				Arc::new(ReqwestSimpleHttp::with_client(ctx.http.clone())),
 			),
 			state: ConnectionStateMap::default(),
-			latest_version: tokio::sync::Mutex::default(),
+			latest_version,
 		})
 	}
 
@@ -543,7 +572,7 @@ impl ConnectionManager {
 	/// time to allow for fast loads.
 	pub async fn get_latest_release(&self) -> Result<Release, CodeError> {
 		let mut latest = self.latest_version.lock().await;
-		let now = Instant::now();
+		let now: Instant = Instant::now();
 		let target_kind = TargetKind::Web;
 		if let Some((checked_at, release)) = &*latest {
 			if checked_at.elapsed() < Duration::from_secs(RELEASE_CACHE_SECS) {
@@ -567,25 +596,6 @@ impl ConnectionManager {
 		if let (Err(e), Some((_, previous))) = (&release, &*latest) {
 			warning!(self.log, "error getting latest release, using stale: {}", e);
 			return Ok(previous.clone());
-		}
-
-		// If the update service is unavailable and we have cached data, use that
-		if let Err(e) = &release {
-			warning!(self.log, "error getting latest release: {}", e);
-			if let Some(latest_commit) = self.cache.get().first() {
-				warning!(self.log, "using latest release available from cache");
-				let release = Release {
-					name: String::from("0.0.0"), // Version information not stored on cache
-					commit: latest_commit.clone(),
-					platform: self.platform,
-					target: target_kind,
-					quality
-				};
-
-				*latest = Some((now, release.clone()));
-
-				return Ok(release)
-			}
 		}
 
 		let release = release?;
